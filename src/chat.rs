@@ -4,7 +4,10 @@ use crate::format::{format_msgs, generate_summary, maybe_dump_prompt};
 use crate::log;
 use crate::memory::{EventMemory, SelfMemory};
 use crate::rpc::cfg_model;
-use crate::sticker::{get_sticker_multiplier, search_sticker, update_sticker_multipliers, StickerHit};
+use crate::sticker::{
+    get_sticker_multiplier, prepare_sticker_search, schedule_sticker_fill, search_sticker,
+    update_sticker_multipliers, StickerHit,
+};
 use crate::types::{collect_recent_pokes, remember_poke, AppState, Message};
 use crate::util::{get_readable_datetime, json_f64_vec, now_ts, truncate};
 use regex::Regex;
@@ -606,17 +609,21 @@ async fn execute_actions(
         .collect();
     let mut sticker_hits: HashMap<usize, StickerHit> = HashMap::new();
     if !sticker_indexes.is_empty() {
-        let timeout = cfg.f64_or("chat.sticker.timeout", 5.0);
-        let fut = async {
-            for i in &sticker_indexes {
-                if let Action::Sticker { query } = &actions[*i] {
-                    sticker_hits.insert(*i, search_sticker(&state.rpc, msg.group_id, query).await);
+        let can_search = prepare_sticker_search(&state.rpc).await;
+        if can_search {
+            let timeout = cfg.f64_or("chat.sticker.timeout", 5.0);
+            let fut = async {
+                for i in &sticker_indexes {
+                    if let Action::Sticker { query } = &actions[*i] {
+                        sticker_hits.insert(*i, search_sticker(&state.rpc, msg.group_id, query).await);
+                    }
                 }
+            };
+            match tokio::time::timeout(Duration::from_secs_f64(timeout.max(0.1)), fut).await {
+                Ok(()) => {}
+                Err(_) => log::warning("Sticker搜索超时，抛弃未就绪的表情包"),
             }
-        };
-        match tokio::time::timeout(Duration::from_secs_f64(timeout.max(0.1)), fut).await {
-            Ok(()) => {}
-            Err(_) => log::warning("Sticker搜索超时，抛弃未就绪的表情包"),
+            schedule_sticker_fill(state.rpc.clone());
         }
     }
 
