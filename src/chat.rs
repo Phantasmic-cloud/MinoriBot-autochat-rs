@@ -802,15 +802,17 @@ pub async fn run_loop(state: AppState) {
             None => continue,
         };
         for v in arr {
-            let Some(msg) = Message::from_json(&v, None) else {
+            let Some(mut msg) = Message::from_json(&v, None) else {
                 continue;
             };
             let group_id = msg.group_id;
             if let Some(tx) = group_tx.get(&group_id) {
-                if tx.send(msg).is_err() {
-                    group_tx.remove(&group_id);
-                } else {
-                    continue;
+                match tx.send(msg) {
+                    Ok(()) => continue,
+                    Err(e) => {
+                        group_tx.remove(&group_id);
+                        msg = e.0;
+                    }
                 }
             }
             let (tx, rx) = mpsc::unbounded_channel();

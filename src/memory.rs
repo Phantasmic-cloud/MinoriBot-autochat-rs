@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::filedb::{get_file_db, FileDb};
 use crate::log;
 use crate::util::{f32_from_le_bytes, f32_to_le_bytes, l2_sq_distance, now_ts};
-use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -42,7 +41,7 @@ pub struct SelfMemory {
 pub struct MemorySystem {
     group_id: i64,
     file_db: FileDb,
-    conn: Mutex<Connection>,
+    db_path: PathBuf,
 }
 
 impl MemorySystem {
@@ -51,14 +50,22 @@ impl MemorySystem {
         let chroma_dir = PathBuf::from(data_dir).join(format!("memory_chromadb_{group_id}"));
         let _ = fs::create_dir_all(&chroma_dir);
         let db_path = chroma_dir.join("chroma.sqlite3");
-        let conn = Connection::open(&db_path).expect("open chroma.sqlite3");
-        init_schema(&conn);
-        import_chroma_if_any(&conn);
+        {
+            let conn = Connection::open(&db_path).expect("open chroma.sqlite3");
+            init_schema(&conn);
+            import_chroma_if_any(&conn);
+        }
         MemorySystem {
             group_id,
             file_db: get_file_db(PathBuf::from(data_dir).join(format!("memory_{group_id}.json"))),
-            conn: Mutex::new(conn),
+            db_path,
         }
+    }
+
+    fn open(&self) -> anyhow::Result<Connection> {
+        let conn = Connection::open(&self.db_path)?;
+        init_schema(&conn);
+        Ok(conn)
     }
 
     fn text_emb_dim(&self) -> usize {
@@ -75,7 +82,7 @@ impl MemorySystem {
         let memory_id = uuid::Uuid::new_v4().to_string();
         let created_at = now_ts();
         let blob = f32_to_le_bytes(embedding);
-        let conn = self.conn.lock();
+        let conn = self.open()?;
         conn.execute(
             "INSERT INTO event_memroy (id, text, type, weight, created_at, embedding)
              VALUES (?1, ?2, 'short_term', ?3, ?4, ?5)",
@@ -87,7 +94,7 @@ impl MemorySystem {
     }
 
     pub fn em_increase_weight(&self, memory_id: &str, weight_increase: i64, threshold: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.open()?;
         let row: Option<(i64, String)> = conn
             .query_row(
                 "SELECT weight, type FROM event_memroy WHERE id = ?1",
@@ -124,7 +131,7 @@ impl MemorySystem {
         for emb in query_embeddings {
             anyhow::ensure!(emb.len() == dim, "Embedding维度错误");
         }
-        let conn = self.conn.lock();
+        let conn = self.open()?;
         let mut sql = "SELECT id, text, type, weight, created_at, embedding FROM event_memroy".to_string();
         if memory_type == "short_term" || memory_type == "long_term" {
             sql.push_str(" WHERE type = ?1");
@@ -214,7 +221,7 @@ impl MemorySystem {
     }
 
     pub fn em_forget(&self, forget_time: f64, forget_prob: f64) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.open()?;
         let ids: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT id FROM event_memroy WHERE type = 'short_term' AND created_at < ?1",
