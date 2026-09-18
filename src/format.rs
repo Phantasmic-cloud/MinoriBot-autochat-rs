@@ -3,7 +3,6 @@ use crate::log;
 use crate::rpc::cfg_model;
 use crate::types::{poke_person_label, AppState, Message};
 use crate::util::{get_readable_datetime, truncate};
-use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
@@ -117,7 +116,6 @@ pub async fn format_msgs(
     let mut texts = Vec::new();
     let mut captioned_images = 0.0f64;
     let mut captioned_emotions = 0.0f64;
-    let mut rng = rand::thread_rng();
     for msg in &msgs {
         let mut text = format!(
             "{} [{}] {}({}):\n",
@@ -172,13 +170,13 @@ pub async fn format_msgs(
                 "image" => {
                     let sub = json_i64(sdata.get("sub_type"));
                     if sub == 0 {
-                        let use_llm =
-                            captioned_images < image_caption_limit && rng.gen::<f64>() < image_caption_prob;
+                        let use_llm = captioned_images < image_caption_limit
+                            && rand::random::<f64>() < image_caption_prob;
                         text.push_str(&get_image_caption(state, &sdata, use_llm).await);
                         captioned_images += 1.0;
                     } else {
                         let use_llm = captioned_emotions < emotion_caption_limit
-                            && rng.gen::<f64>() < emotion_caption_prob;
+                            && rand::random::<f64>() < emotion_caption_prob;
                         text.push_str(&get_image_caption(state, &sdata, use_llm).await);
                         captioned_emotions += 1.0;
                     }

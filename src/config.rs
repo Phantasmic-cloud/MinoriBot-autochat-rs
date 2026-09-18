@@ -163,10 +163,9 @@ pub fn mapping_get<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
         }
     }
     if let Ok(f) = key.parse::<f64>() {
-        if let Some(n) = serde_yaml::Number::from_f64(f) {
-            if let Some(val) = map.get(&Value::Number(n)) {
-                return Some(val);
-            }
+        let n = serde_yaml::Number::from(f);
+        if let Some(val) = map.get(&Value::Number(n)) {
+            return Some(val);
         }
     }
     None
