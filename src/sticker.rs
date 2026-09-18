@@ -1,11 +1,13 @@
 use crate::config::Config;
 use crate::log;
 use crate::rpc::RpcSession;
-use crate::util::{cosine_similarity, json_f64_vec, truncate};
+use crate::util::{cosine_similarity, json_f64_vec};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
@@ -52,45 +54,70 @@ fn file_mtime(path: &str) -> Option<f64> {
         .map(|d| d.as_secs_f64())
 }
 
+#[derive(Deserialize)]
+struct EmbDbFile {
+    #[serde(default)]
+    emb_model: String,
+    #[serde(default)]
+    embeddings: HashMap<String, Vec<f32>>,
+}
+
+#[derive(Serialize)]
+struct EmbDbSave<'a> {
+    emb_model: &'a str,
+    embeddings: HashMap<String, &'a Vec<f32>>,
+}
+
 fn load_emb_db(model: &str) -> HashMap<String, Vec<f32>> {
-    let text = match fs::read_to_string(STK_EMB_DB_PATH) {
-        Ok(t) => t,
+    let file = match fs::File::open(STK_EMB_DB_PATH) {
+        Ok(f) => f,
         Err(_) => return HashMap::new(),
     };
-    let db: Value = match serde_json::from_str(&text) {
+    let db: EmbDbFile = match serde_json::from_reader(BufReader::new(file)) {
         Ok(v) => v,
         Err(e) => {
             log::warning(format!("读取stk_emb_db.json失败，重新建立: {e}"));
             return HashMap::new();
         }
     };
-    let stored = db.get("emb_model").and_then(|v| v.as_str()).unwrap_or("");
-    if stored != model {
-        log::info(format!("Embedding模型已变更({stored} -> {model})，清空向量库"));
+    if db.emb_model != model {
+        log::info(format!(
+            "Embedding模型已变更({} -> {model})，清空向量库",
+            db.emb_model
+        ));
         return HashMap::new();
     }
-    let mut out = HashMap::new();
-    if let Some(map) = db.get("embeddings").and_then(|v| v.as_object()) {
-        for (k, v) in map {
-            if let Some(vec) = json_f64_vec(v) {
-                out.insert(k.clone(), vec);
-            }
-        }
-    }
-    out
+    db.embeddings
 }
 
-fn save_emb_db(model: &str, embeddings: &HashMap<String, Vec<f32>>) {
+fn save_emb_db(model: &str, cache: &[CacheItem]) {
     if let Some(parent) = Path::new(STK_EMB_DB_PATH).parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let mut obj = serde_json::Map::new();
-    for (k, v) in embeddings {
-        obj.insert(k.clone(), json!(v));
+    let mut embeddings = HashMap::with_capacity(cache.len() * 2);
+    for item in cache {
+        let k = format!("{}:{}", item.sid, item.text);
+        embeddings.insert(format!("e:{k}"), &item.emotion_emb);
+        embeddings.insert(k, &item.full_emb);
     }
-    let db = json!({"emb_model": model, "embeddings": obj});
-    if let Ok(s) = serde_json::to_string(&db) {
-        let _ = fs::write(STK_EMB_DB_PATH, s);
+    let tmp = format!("{STK_EMB_DB_PATH}.tmp");
+    let ok = (|| -> anyhow::Result<()> {
+        let file = fs::File::create(&tmp)?;
+        let mut w = BufWriter::new(file);
+        serde_json::to_writer(
+            &mut w,
+            &EmbDbSave {
+                emb_model: model,
+                embeddings,
+            },
+        )?;
+        w.flush()?;
+        fs::rename(&tmp, STK_EMB_DB_PATH)?;
+        Ok(())
+    })();
+    if let Err(e) = ok {
+        log::warning(format!("保存stk_emb_db.json失败: {e}"));
+        let _ = fs::remove_file(&tmp);
     }
 }
 
@@ -230,36 +257,36 @@ async fn build_sticker_cache(rpc: &RpcSession, model: &str) -> anyhow::Result<()
         }
     }
 
-    let mut cache = Vec::new();
-    let mut used: HashSet<String> = HashSet::new();
+    let mut cache = Vec::with_capacity(sid_texts.len());
     for (i, (sid, text, path)) in sid_texts.into_iter().enumerate() {
         let k = &keys[i];
         let ek = format!("e:{k}");
-        used.insert(k.clone());
-        used.insert(ek.clone());
-        if let (Some(full), Some(emo)) = (emb_db.get(k), emb_db.get(&ek)) {
-            cache.push(CacheItem {
-                sid,
-                text,
-                path,
-                full_emb: full.clone(),
-                emotion_emb: emo.clone(),
-            });
+        match (emb_db.remove(k), emb_db.remove(&ek)) {
+            (Some(full), Some(emo)) => {
+                cache.push(CacheItem {
+                    sid,
+                    text,
+                    path,
+                    full_emb: full,
+                    emotion_emb: emo,
+                });
+            }
+            _ => {}
         }
     }
-    let new_emb_db: HashMap<_, _> = emb_db.into_iter().filter(|(k, _)| used.contains(k)).collect();
-    save_emb_db(model, &new_emb_db);
+    drop(emb_db);
+    save_emb_db(model, &cache);
 
     let mut st = state().lock();
     let is_update = st.cache_mtime > 0.0;
+    let n = cache.len();
     st.cache = cache;
     st.cache_mtime = mtime;
     log::info(format!(
         "Sticker{}完成，共{}条向量",
         if is_update { "更新" } else { "缓存" },
-        st.cache.len()
+        n
     ));
-    let _ = truncate;
     Ok(())
 }
 
