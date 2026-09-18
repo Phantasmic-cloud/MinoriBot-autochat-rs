@@ -1,0 +1,26 @@
+[package]
+name = "autochat-rs"
+version = "0.1.0"
+edition = "2021"
+description = "MinoriBot autochat microservice (Rust port of services/autochat)"
+
+[[bin]]
+name = "autochat-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures-util = "0.3"
+parking_lot = "0.12"
+rand = "0.8"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
