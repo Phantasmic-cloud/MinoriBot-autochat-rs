@@ -36,6 +36,7 @@ pub struct SelfMemory {
     pub time: f64,
     pub text: String,
     pub sticker: String,
+    pub tts: String,
 }
 
 pub struct MemorySystem {
@@ -335,7 +336,7 @@ impl MemorySystem {
         results
     }
 
-    pub fn sm_add(&self, msg_id: i64, keep_count: usize, text: &str, sticker: &str) {
+    pub fn sm_add(&self, msg_id: i64, keep_count: usize, text: &str, sticker: &str, tts: &str) {
         let mut sms = self.file_db.get_or("sms", json!([]));
         if !sms.is_array() {
             sms = json!([]);
@@ -346,6 +347,8 @@ impl MemorySystem {
         });
         if !sticker.is_empty() {
             item["sticker"] = json!(sticker);
+        } else if !tts.is_empty() {
+            item["tts"] = json!(tts);
         } else {
             item["text"] = json!(text);
         }
@@ -373,6 +376,7 @@ fn parse_self_memory(v: &Value) -> Option<SelfMemory> {
         time: v.get("time").and_then(|t| t.as_f64()).unwrap_or(0.0),
         text: v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         sticker: v.get("sticker").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+        tts: v.get("tts").and_then(|t| t.as_str()).unwrap_or("").to_string(),
     })
 }
 

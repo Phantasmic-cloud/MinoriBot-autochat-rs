@@ -1,8 +1,9 @@
 use serde_json::Value;
 
-pub const MAX_ACTIONS: usize = 5;
+pub const MAX_ACTIONS: usize = 6;
 pub const MAX_TEXT_ACTIONS: usize = 3;
 pub const MAX_REACT_ACTIONS: usize = 3;
+pub const MAX_TTS_ACTIONS: usize = 1;
 
 #[derive(Clone, Debug)]
 pub enum Action {
@@ -10,6 +11,7 @@ pub enum Action {
     Poke { ids: Vec<i64> },
     Sticker { query: Value },
     React { msg_id: i64, emoji_id: String },
+    Tts { text: String },
 }
 
 impl Action {
@@ -19,6 +21,7 @@ impl Action {
             Action::Poke { .. } => "poke",
             Action::Sticker { .. } => "sticker",
             Action::React { .. } => "react",
+            Action::Tts { .. } => "tts",
         }
     }
 }
@@ -157,6 +160,18 @@ fn expand_action_item(item: &Value) -> Vec<Action> {
             "sticker" if sticker_query_ok(val) => {
                 actions.push(Action::Sticker { query: val.clone() });
             }
+            "tts" => {
+                let text = if val.is_null() {
+                    String::new()
+                } else if let Some(s) = val.as_str() {
+                    s.trim().to_string()
+                } else {
+                    val.to_string().trim().to_string()
+                };
+                if !text.is_empty() {
+                    actions.push(Action::Tts { text });
+                }
+            }
             "react" => {
                 if let Some((msg_id, emoji_id)) = parse_react(val) {
                     actions.push(Action::React { msg_id, emoji_id });
@@ -178,6 +193,7 @@ pub fn parse_actions(llm_response: &Value) -> Vec<Action> {
     let mut out = Vec::new();
     let mut text_n = 0;
     let mut react_n = 0;
+    let mut tts_n = 0;
     for action in actions {
         if out.len() >= MAX_ACTIONS {
             break;
@@ -194,6 +210,12 @@ pub fn parse_actions(llm_response: &Value) -> Vec<Action> {
                     continue;
                 }
                 react_n += 1;
+            }
+            Action::Tts { .. } => {
+                if tts_n >= MAX_TTS_ACTIONS {
+                    continue;
+                }
+                tts_n += 1;
             }
             _ => {}
         }

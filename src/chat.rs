@@ -10,6 +10,7 @@ use crate::sticker::{
 };
 use crate::types::{collect_recent_pokes, remember_poke, AppState, Message};
 use crate::util::{get_readable_datetime, json_f64_vec, now_ts, truncate};
+use crate::voice::{prefetch_voice, VoiceHit};
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -293,6 +294,8 @@ pub async fn chat(state: &AppState, msg: Message) {
             for sm in &sms {
                 let body = if !sm.sticker.is_empty() {
                     format!("[表情包: {}]", sm.sticker)
+                } else if !sm.tts.is_empty() {
+                    format!("[语音: {}]", sm.tts)
                 } else {
                     sm.text.clone()
                 };
@@ -484,9 +487,11 @@ pub async fn chat(state: &AppState, msg: Message) {
     let keep_count = cfg.usize_or("chat.mem.sm_keep_count", 10);
     for (msg_id, kind, content) in send_msg_id_texts {
         if kind == "sticker" {
-            mem.sm_add(msg_id, keep_count, "", &content);
+            mem.sm_add(msg_id, keep_count, "", &content, "");
+        } else if kind == "tts" {
+            mem.sm_add(msg_id, keep_count, "", "", &content);
         } else {
-            mem.sm_add(msg_id, keep_count, &content, "");
+            mem.sm_add(msg_id, keep_count, &content, "", "");
         }
     }
 
@@ -579,7 +584,8 @@ async fn prepare_context(
 
 struct ExecAction {
     action: Action,
-    hit: Option<StickerHit>,
+    sticker_hit: Option<StickerHit>,
+    tts_hit: Option<VoiceHit>,
 }
 
 async fn execute_actions(
@@ -607,25 +613,57 @@ async fn execute_actions(
         .filter(|(_, a)| matches!(a, Action::Sticker { .. }))
         .map(|(i, _)| i)
         .collect();
-    let mut sticker_hits: HashMap<usize, StickerHit> = HashMap::new();
-    if !sticker_indexes.is_empty() {
+    let tts_indexes: Vec<usize> = actions
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| matches!(a, Action::Tts { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let sticker_fut = async {
+        let hits: HashMap<usize, StickerHit> = HashMap::new();
+        if sticker_indexes.is_empty() {
+            return hits;
+        }
         let can_search = prepare_sticker_search(&state.rpc).await;
-        if can_search {
-            let timeout = cfg.f64_or("chat.sticker.timeout", 5.0);
-            let fut = async {
-                for i in &sticker_indexes {
-                    if let Action::Sticker { query } = &actions[*i] {
-                        sticker_hits.insert(*i, search_sticker(&state.rpc, msg.group_id, query).await);
-                    }
+        if !can_search {
+            return hits;
+        }
+        let timeout = cfg.f64_or("chat.sticker.timeout", 5.0);
+        let search = async {
+            let mut inner: HashMap<usize, StickerHit> = HashMap::new();
+            for i in &sticker_indexes {
+                if let Action::Sticker { query } = &actions[*i] {
+                    inner.insert(*i, search_sticker(&state.rpc, msg.group_id, query).await);
                 }
-            };
-            match tokio::time::timeout(Duration::from_secs_f64(timeout.max(0.1)), fut).await {
-                Ok(()) => {}
-                Err(_) => log::warning("Sticker搜索超时，抛弃未就绪的表情包"),
             }
+            inner
+        };
+        match tokio::time::timeout(Duration::from_secs_f64(timeout.max(0.1)), search).await {
+            Ok(inner) => inner,
+            Err(_) => {
+                log::warning("Sticker搜索超时，抛弃未就绪的表情包");
+                hits
+            }
+        }
+    };
+    let voice_fut = async {
+        let mut hits: HashMap<usize, VoiceHit> = HashMap::new();
+        for i in &tts_indexes {
+            if let Action::Tts { text } = &actions[*i] {
+                hits.insert(*i, prefetch_voice(&state.rpc, text).await);
+            }
+        }
+        hits
+    };
+    let (sticker_hits, tts_hits) = if !sticker_indexes.is_empty() || !tts_indexes.is_empty() {
+        let pair = tokio::join!(sticker_fut, voice_fut);
+        if !sticker_indexes.is_empty() {
             schedule_sticker_fill(state.rpc.clone());
         }
-    }
+        pair
+    } else {
+        (HashMap::new(), HashMap::new())
+    };
 
     let mut exec_actions = Vec::new();
     for (i, action) in actions.iter().enumerate() {
@@ -635,21 +673,30 @@ async fn execute_actions(
                     Some(hit) if hit.path.is_some() => {
                         exec_actions.push(ExecAction {
                             action: action.clone(),
-                            hit: Some(StickerHit {
+                            sticker_hit: Some(StickerHit {
                                 path: hit.path.clone(),
                                 sid: hit.sid,
                                 all_sids: hit.all_sids.clone(),
                                 old_multipliers: hit.old_multipliers.clone(),
                             }),
+                            tts_hit: None,
                         });
                     }
                     Some(_) => log::info("未匹配到表情包，跳过发送"),
                     None => log::info("表情包未就绪，跳过发送"),
                 }
             }
+            Action::Tts { .. } => {
+                exec_actions.push(ExecAction {
+                    action: action.clone(),
+                    sticker_hit: None,
+                    tts_hit: tts_hits.get(&i).cloned(),
+                });
+            }
             _ => exec_actions.push(ExecAction {
                 action: action.clone(),
-                hit: None,
+                sticker_hit: None,
+                tts_hit: None,
             }),
         }
     }
@@ -703,7 +750,7 @@ async fn execute_actions(
                 }
             }
             Action::Sticker { query } => {
-                let hit = match item.hit {
+                let hit = match item.sticker_hit {
                     Some(h) => h,
                     None => continue,
                 };
@@ -774,6 +821,79 @@ async fn execute_actions(
                 {
                     Ok(_) => log::info(format!("贴表情成功: msg_id={msg_id} emoji_id={emoji_id}")),
                     Err(e) => log::warning(format!("贴表情失败 msg_id={msg_id} emoji_id={emoji_id}: {e}")),
+                }
+            }
+            Action::Tts { text } => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    log::info("TTS文本为空，跳过发送");
+                    continue;
+                }
+                let hit = item.tts_hit.unwrap_or(VoiceHit::Text(text.clone()));
+                let mut fallback = false;
+                match hit {
+                    VoiceHit::Skip => {
+                        log::info("TTS文本为空，跳过发送");
+                    }
+                    VoiceHit::File(path) => {
+                        log::info(format!("自动聊天发送语音: {text}"));
+                        let cq = format!("[CQ:record,file=file://{path}]");
+                        match state.rpc.send_group_msg(msg.group_id, &cq).await {
+                            Ok(ret) => {
+                                if let Some(send_msg_id) = json_i64(ret.get("message_id")) {
+                                    send_msg_id_texts.push((send_msg_id, "tts", text.clone()));
+                                    log::info(format!("语音发送成功: send_msg_id={send_msg_id}"));
+                                    note_sent_msg(state, msg.group_id, send_msg_id);
+                                } else {
+                                    log::info("语音未发出，回退文字");
+                                    fallback = true;
+                                }
+                            }
+                            Err(e) => {
+                                log::warning(format!("语音发送失败，回退文字: {e}"));
+                                fallback = true;
+                            }
+                        }
+                    }
+                    VoiceHit::Text(_) => fallback = true,
+                }
+                if fallback {
+                    text_index += 1;
+                    let mut send_text = text;
+                    let mut at_id: Option<i64> = None;
+                    let mut reply_id: Option<i64> = None;
+                    if let Some(cap) = at_re.captures(&send_text) {
+                        if let Ok(id) = cap[1].parse::<i64>() {
+                            at_id = Some(id);
+                            send_text = send_text.replace(&cap[0], "");
+                            if recent_msgs.iter().any(|m| m.user_id == id) {
+                                send_text = format!("[CQ:at,qq={id}]{send_text}");
+                            }
+                        }
+                    }
+                    if let Some(cap) = reply_re.captures(&send_text) {
+                        if let Ok(id) = cap[1].parse::<i64>() {
+                            reply_id = Some(id);
+                            send_text = send_text.replace(&cap[0], "");
+                            if recent_msgs.iter().any(|m| m.msg_id == id) {
+                                send_text = format!("[CQ:reply,id={id}]{send_text}");
+                            }
+                        }
+                    }
+                    send_text = truncate(&send_text, cfg.i64_or("chat.reply_max_length", 512));
+                    log::info(format!(
+                        "自动聊天生成回复{text_index}: {send_text} at_id={:?} reply_id={:?}",
+                        at_id, reply_id
+                    ));
+                    match state.rpc.send_group_msg(msg.group_id, &send_text).await {
+                        Ok(ret) => {
+                            let send_msg_id = json_i64(ret.get("message_id")).unwrap_or(0);
+                            send_msg_id_texts.push((send_msg_id, "text", send_text));
+                            log::info(format!("发送回复{text_index}成功: send_msg_id={send_msg_id}"));
+                            note_sent_msg(state, msg.group_id, send_msg_id);
+                        }
+                        Err(e) => log::warning(format!("发送回复失败: {e}")),
+                    }
                 }
             }
         }

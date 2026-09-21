@@ -272,6 +272,10 @@ impl RpcSession {
         )
         .await
     }
+
+    pub async fn synth_tts(&self, text: &str, timeout_secs: f64) -> Result<Value, RpcError> {
+        self.call("synth_tts", vec![json!(text)], timeout_secs.max(0.1)).await
+    }
 }
 
 pub fn cfg_model(key: &str) -> Value {
