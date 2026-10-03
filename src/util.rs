@@ -41,6 +41,11 @@ pub fn get_readable_datetime(ts: f64, show_original_time: bool) -> String {
     }
 }
 
+/// 纯相对时间，如 "8秒前"、"3分钟前"。顶栏已给绝对时间，正文只需相对时间，省 token。
+pub fn get_short_time(ts: f64) -> String {
+    get_readable_datetime(ts, false)
+}
+
 #[allow(dead_code)]
 pub fn get_readable_timedelta(delta: Duration) -> String {
     let mut s = delta.num_seconds();

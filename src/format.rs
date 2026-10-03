@@ -1,11 +1,13 @@
 use crate::config::{python_format, Config};
 use crate::log;
 use crate::rpc::cfg_model;
-use crate::types::{poke_person_label, AppState, Message};
-use crate::util::{get_readable_datetime, truncate};
+use crate::types::{person_label, AppState, Message};
+use crate::util::{get_short_time, truncate};
+use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
+use std::sync::OnceLock;
 
 pub fn debug_mode() -> bool {
     Config::global().str_or("log_level", "INFO").eq_ignore_ascii_case("DEBUG")
@@ -102,6 +104,70 @@ pub async fn get_image_caption(state: &AppState, data: &Value, use_llm: bool) ->
     }
 }
 
+/// 禁言时长转成人类可读描述。duration 单位为秒。
+fn ban_desc(duration: i64) -> String {
+    if duration <= 0 {
+        return "被永久禁言".into();
+    }
+    if duration % 86400 == 0 {
+        format!("被禁言{}天", duration / 86400)
+    } else if duration % 3600 == 0 {
+        format!("被禁言{}小时", duration / 3600)
+    } else if duration % 60 == 0 {
+        format!("被禁言{}分钟", duration / 60)
+    } else {
+        format!("被禁言{duration}秒")
+    }
+}
+
+/// 把一条群事件渲染成一行自然语言，供 {notice_text} 注入。对齐 py 的 `format_notice`。
+pub fn format_notice(msg: &Message, self_id: i64) -> String {
+    let d = msg.notice_data();
+    let ntype = d.get("notice_type").and_then(|v| v.as_str()).unwrap_or("");
+    let stype = d.get("sub_type").and_then(|v| v.as_str()).unwrap_or("");
+    let who = person_label(msg.user_id, &msg.nickname, self_id);
+    if ntype == "notify" && stype == "poke" {
+        let tid = json_i64(d.get("target_id"));
+        let tname = d
+            .get("target_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let tname = if tname.is_empty() { tid.to_string() } else { tname.to_string() };
+        return format!("{who} 戳了戳 {}", person_label(tid, &tname, self_id));
+    }
+    if ntype == "group_increase" {
+        return format!("{who} 加入群聊");
+    }
+    if ntype == "group_decrease" {
+        return if stype == "kick" {
+            format!("{who} 被踢出群聊")
+        } else {
+            format!("{who} 退出群聊")
+        };
+    }
+    if ntype == "group_ban" {
+        if stype == "lift_ban" {
+            return format!("{who} 被解除禁言");
+        }
+        return format!("{who} {}", ban_desc(json_i64(d.get("duration"))));
+    }
+    format!("{who} 发生了一条群事件")
+}
+
+/// 把自身记忆里的 CQ 码还原成 {recent_text} 的写法。对齐 py 的 `_cq_to_readable`。
+pub fn cq_to_readable(text: &str) -> String {
+    static AT_RE: OnceLock<Regex> = OnceLock::new();
+    static REPLY_RE: OnceLock<Regex> = OnceLock::new();
+    let at_re = AT_RE.get_or_init(|| Regex::new(r"\[CQ:at,qq=(\d+)(?:,[^\]]*)?\]").unwrap());
+    let reply_re =
+        REPLY_RE.get_or_init(|| Regex::new(r"\[CQ:reply,id=(-?\d+)(?:,[^\]]*)?\]").unwrap());
+    let s = at_re.replace_all(text, "[@$1]").to_string();
+    reply_re.replace_all(&s, "[reply=$1]").to_string()
+}
+
+/// 渲染聊天记录与群事件。
+///
+/// 返回 (消息文本, 群事件文本) 两路输出：群事件单独成段，不混进 {recent_text}。
 pub async fn format_msgs(
     state: &AppState,
     msgs: &[Message],
@@ -110,16 +176,25 @@ pub async fn format_msgs(
     emotion_caption_limit: f64,
     emotion_caption_prob: f64,
     self_id: i64,
-) -> String {
+) -> (String, String) {
     let mut msgs: Vec<Message> = msgs.to_vec();
     msgs.sort_by(|a, b| b.time.partial_cmp(&a.time).unwrap_or(std::cmp::Ordering::Equal));
     let mut texts = Vec::new();
+    let mut notice_texts = Vec::new();
     let mut captioned_images = 0.0f64;
     let mut captioned_emotions = 0.0f64;
     for msg in &msgs {
+        if msg.is_notice() {
+            notice_texts.push(format!(
+                "({}) {}",
+                get_short_time(msg.time),
+                format_notice(msg, self_id)
+            ));
+            continue;
+        }
         let mut text = format!(
-            "{} [{}] {}({}):\n",
-            get_readable_datetime(msg.time, true),
+            "({}) [{}] {}({}):\n",
+            get_short_time(msg.time),
             msg.msg_id,
             msg.nickname,
             msg.user_id
@@ -128,20 +203,6 @@ pub async fn format_msgs(
             let stype = seg.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let sdata = seg.get("data").cloned().unwrap_or(json!({}));
             match stype {
-                "poke" => {
-                    let from_label = poke_person_label(msg.user_id, &msg.nickname, self_id);
-                    let tid = json_i64(sdata.get("target_id"));
-                    let tname = sdata
-                        .get("target_name")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| tid.to_string());
-                    let to_label = poke_person_label(tid, &tname, self_id);
-                    text = format!(
-                        "{} {from_label} 戳了戳 {to_label}",
-                        get_readable_datetime(msg.time, true)
-                    );
-                }
                 "text" => {
                     if let Some(t) = sdata.get("text").and_then(|v| v.as_str()) {
                         text.push_str(t);
@@ -187,7 +248,8 @@ pub async fn format_msgs(
         texts.push(text.trim().to_string());
     }
     texts.reverse();
-    texts.join("\n")
+    notice_texts.reverse();
+    (texts.join("\n"), notice_texts.join("\n"))
 }
 
 pub async fn generate_summary(state: &AppState, text: &str) -> String {

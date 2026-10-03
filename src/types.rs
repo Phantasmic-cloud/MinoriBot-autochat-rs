@@ -55,23 +55,50 @@ impl Message {
         })
     }
 
-    pub fn is_poke(&self) -> bool {
-        self.msg.iter().any(|seg| seg.get("type").and_then(|t| t.as_str()) == Some("poke"))
+    pub fn is_notice(&self) -> bool {
+        self.msg.iter().any(|seg| seg.get("type").and_then(|t| t.as_str()) == Some("notice"))
     }
 
-    pub fn poke_target_id(&self) -> i64 {
+    pub fn notice_data(&self) -> Value {
         for seg in &self.msg {
-            if seg.get("type").and_then(|t| t.as_str()) == Some("poke") {
-                if let Some(data) = seg.get("data") {
-                    return json_i64(data.get("target_id").unwrap_or(&Value::Null));
-                }
+            if seg.get("type").and_then(|t| t.as_str()) == Some("notice") {
+                return seg.get("data").cloned().unwrap_or(Value::Null);
             }
         }
-        0
+        Value::Null
     }
 
-    pub fn poke_key(&self) -> (i64, i64, i64) {
-        (self.time as i64, self.user_id, self.poke_target_id())
+    pub fn notice_is_poke(&self) -> bool {
+        if !self.is_notice() {
+            return false;
+        }
+        let d = self.notice_data();
+        d.get("notice_type").and_then(|v| v.as_str()) == Some("notify")
+            && d.get("sub_type").and_then(|v| v.as_str()) == Some("poke")
+    }
+
+    pub fn notice_target_id(&self) -> i64 {
+        json_i64(self.notice_data().get("target_id").unwrap_or(&Value::Null))
+    }
+
+    /// 去重签名，对齐 py 的 `_notice_key`：不含时间戳，靠 (群, 类型, 涉及的人) 唯一标识一条事件。
+    pub fn notice_key(&self) -> (i64, i64, String, String, i64, i64, i64) {
+        let d = self.notice_data();
+        let s = |k: &str| {
+            d.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        (
+            self.time as i64,
+            self.group_id,
+            s("notice_type"),
+            s("sub_type"),
+            self.user_id,
+            json_i64(d.get("operator_id").unwrap_or(&Value::Null)),
+            json_i64(d.get("target_id").unwrap_or(&Value::Null)),
+        )
     }
 
     pub fn plain_text(&self) -> String {
@@ -87,37 +114,37 @@ impl Message {
     }
 }
 
-const POKE_KEEP: usize = 10;
+const NOTICE_KEEP: usize = 10;
 
-static GROUP_POKES: OnceLock<Mutex<HashMap<i64, Vec<Message>>>> = OnceLock::new();
+static GROUP_NOTICES: OnceLock<Mutex<HashMap<i64, Vec<Message>>>> = OnceLock::new();
 
-fn pokes() -> &'static Mutex<HashMap<i64, Vec<Message>>> {
-    GROUP_POKES.get_or_init(|| Mutex::new(HashMap::new()))
+fn notices() -> &'static Mutex<HashMap<i64, Vec<Message>>> {
+    GROUP_NOTICES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn remember_poke(msg: &Message) {
-    let mut map = pokes().lock();
+pub fn remember_notice(msg: &Message) {
+    let mut map = notices().lock();
     let lst = map.entry(msg.group_id).or_default();
-    let key = msg.poke_key();
-    if lst.iter().any(|p| p.poke_key() == key) {
+    let key = msg.notice_key();
+    if lst.iter().any(|p| p.notice_key() == key) {
         return;
     }
     lst.push(msg.clone());
-    let extra = lst.len().saturating_sub(POKE_KEEP);
+    let extra = lst.len().saturating_sub(NOTICE_KEEP);
     if extra > 0 {
         lst.drain(0..extra);
     }
 }
 
-pub fn collect_recent_pokes(group_id: i64, since: f64) -> Vec<Message> {
-    pokes()
+pub fn collect_recent_notices(group_id: i64, since: f64) -> Vec<Message> {
+    notices()
         .lock()
         .get(&group_id)
         .map(|lst| lst.iter().filter(|p| p.time >= since).cloned().collect())
         .unwrap_or_default()
 }
 
-pub fn poke_person_label(uid: i64, name: &str, self_id: i64) -> String {
+pub fn person_label(uid: i64, name: &str, self_id: i64) -> String {
     if uid == self_id {
         "你".into()
     } else if name.is_empty() {

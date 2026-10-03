@@ -1,6 +1,6 @@
 use crate::actions::{parse_actions, Action};
 use crate::config::{persona_for, python_format, value_to_f64, Config};
-use crate::format::{format_msgs, generate_summary, maybe_dump_prompt};
+use crate::format::{cq_to_readable, format_msgs, generate_summary, maybe_dump_prompt};
 use crate::log;
 use crate::memory::{EventMemory, SelfMemory};
 use crate::rpc::cfg_model;
@@ -8,8 +8,8 @@ use crate::sticker::{
     get_sticker_multiplier, prepare_sticker_search, schedule_sticker_fill, search_sticker,
     update_sticker_multipliers, StickerHit,
 };
-use crate::types::{collect_recent_pokes, remember_poke, AppState, Message};
-use crate::util::{get_readable_datetime, json_f64_vec, now_ts, truncate};
+use crate::types::{collect_recent_notices, remember_notice, AppState, Message};
+use crate::util::{get_short_time, json_f64_vec, now_ts, truncate};
 use crate::voice::{prefetch_voice, VoiceHit};
 use regex::Regex;
 use serde_json::{json, Value};
@@ -104,18 +104,23 @@ pub async fn chat(state: &AppState, msg: Message) {
         }
     };
 
-    let is_poke = msg.is_poke();
-    let poke_target = if is_poke { msg.poke_target_id() } else { 0 };
-    if is_poke {
-        remember_poke(&msg);
+    let is_notice = msg.is_notice();
+    // 只有「自己被戳」才算需要回应的事件；入群/退群/禁言只入时间线，不触发回复
+    let is_notice_poke = msg.notice_is_poke();
+    let poke_target = if is_notice_poke { msg.notice_target_id() } else { 0 };
+    if is_notice {
+        remember_notice(&msg);
     }
     if msg.user_id == self_id {
         return;
     }
-    if !is_poke && msg.plain_text().starts_with('/') {
+    if !is_notice && msg.plain_text().starts_with('/') {
         return;
     }
-    if is_poke && poke_target != self_id {
+    if is_notice_poke && poke_target != self_id {
+        return;
+    }
+    if is_notice && !is_notice_poke {
         return;
     }
 
@@ -126,7 +131,7 @@ pub async fn chat(state: &AppState, msg: Message) {
         }
     }
 
-    if is_poke {
+    if is_notice_poke {
         log::info(format!(
             "{} 的戳一戳 {}({}) -> {poke_target}",
             msg.group_id, msg.nickname, msg.user_id
@@ -150,7 +155,7 @@ pub async fn chat(state: &AppState, msg: Message) {
         delta -= (cfg.f64_or("chat.willing.decrease_per_minute", 0.005) * time_passed / 60.0)
             .min(status.willingness);
     }
-    if is_poke {
+    if is_notice_poke {
         delta += cfg.f64_or("chat.willing.increase_per_poke", 0.3);
     } else {
         delta += cfg.f64_or("chat.willing.increase_per_msg", 0.005);
@@ -217,8 +222,8 @@ pub async fn chat(state: &AppState, msg: Message) {
     log::info("=".repeat(20));
     log::info(format!("开始对消息 {} 进行聊天处理", msg.msg_id));
 
-    let (recent_msgs, recent_text, recent_summary, query_embs, recent_emb) =
-        match prepare_context(state, &msg, is_poke).await {
+    let (recent_msgs, notice_lines, recent_text, recent_summary, query_embs, recent_emb) =
+        match prepare_context(state, &msg, is_notice).await {
             Ok(v) => v,
             Err(e) => {
                 log::error(format!("处理消息时失败，放弃聊天处理: {e}"));
@@ -266,8 +271,8 @@ pub async fn chat(state: &AppState, msg: Message) {
             em_text.push_str("可能与你当前聊天内容相关的记忆事件:\n```\n");
             for em in short_ems.iter().chain(long_ems.iter()) {
                 em_text.push_str(&format!(
-                    "{}: {}\n",
-                    get_readable_datetime(em.created_at, true),
+                    "({}) {}\n",
+                    get_short_time(em.created_at),
                     em.text
                 ));
             }
@@ -290,18 +295,19 @@ pub async fn chat(state: &AppState, msg: Message) {
             sms.iter().map(|s| &s.id).collect::<Vec<_>>()
         ));
         if !sms.is_empty() {
-            sm_text.push_str("你自己过去的回复记录供参考:\n```\n");
+            sm_text.push_str("你自己过去的回复记录供参考（(??前) [msgid]: 消息）:\n```\n");
             for sm in &sms {
                 let body = if !sm.sticker.is_empty() {
                     format!("[表情包: {}]", sm.sticker)
                 } else if !sm.tts.is_empty() {
                     format!("[语音: {}]", sm.tts)
                 } else {
-                    sm.text.clone()
+                    // 存的是转成 CQ 码的文本，注入时还原成 {recent_text} 的写法
+                    cq_to_readable(&sm.text)
                 };
                 sm_text.push_str(&format!(
-                    "{} [{}]: {body}\n",
-                    get_readable_datetime(sm.time, true),
+                    "({}) [{}]: {body}\n",
+                    get_short_time(sm.time),
                     sm.id
                 ));
             }
@@ -343,8 +349,8 @@ pub async fn chat(state: &AppState, msg: Message) {
                     u_info.push_str("  - 最近事件:\n");
                     for (t, txt) in &um.recent_events {
                         u_info.push_str(&format!(
-                            "    [{}]: {txt}\n",
-                            get_readable_datetime(*t, true)
+                            "    ({}): {txt}\n",
+                            get_short_time(*t)
                         ));
                     }
                 }
@@ -358,7 +364,15 @@ pub async fn chat(state: &AppState, msg: Message) {
         }
     }
 
-    let recent_block = format!("以下是最近的聊天记录:\n```\n{recent_text}\n```");
+    let recent_block = format!(
+        "以下是最近的聊天记录（(??前) [msgid] 当前昵称(qqid): \n消息）:\n```\n{recent_text}\n```"
+    );
+    // 群事件单独成段，无事件时留空
+    let notice_block = if notice_lines.is_empty() {
+        String::new()
+    } else {
+        format!("以下是最近的群事件：\n```\n{notice_lines}\n```\n")
+    };
     let persona_val = cfg.get("chat.prompt.persona");
     let persona = persona_for(&persona_val, msg.group_id);
     let framework = cfg.str("chat.prompt.framework");
@@ -366,7 +380,12 @@ pub async fn chat(state: &AppState, msg: Message) {
     vars.insert("self_id", self_id.to_string());
     vars.insert("self_name", self_name);
     vars.insert("persona", persona);
+    vars.insert(
+        "now_time",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    );
     vars.insert("recent_text", recent_block);
+    vars.insert("notice_text", notice_block);
     vars.insert("em_text", em_text);
     vars.insert("sm_text", sm_text);
     vars.insert("um_text", um_text);
@@ -503,14 +522,16 @@ pub async fn chat(state: &AppState, msg: Message) {
 async fn prepare_context(
     state: &AppState,
     msg: &Message,
-    is_poke: bool,
-) -> anyhow::Result<(Vec<Message>, String, String, Vec<Vec<f32>>, Vec<f32>)> {
+    is_notice: bool,
+) -> anyhow::Result<(Vec<Message>, String, String, String, Vec<Vec<f32>>, Vec<f32>)> {
     let cfg = Config::global();
+    let history_num = cfg.i64_or("chat.history_msg_num", 20);
+    // 多拉一倍：{recent_text} 只放真消息，群事件拆到 {notice_text} 后不该占 recent 名额
     let raw = state
         .rpc
-        .get_group_history_msg(msg.group_id, cfg.i64_or("chat.history_msg_num", 20))
+        .get_group_history_msg(msg.group_id, history_num * 2)
         .await?;
-    let mut recent_msgs: Vec<Message> = raw
+    let recent_msgs: Vec<Message> = raw
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -518,31 +539,45 @@ async fn prepare_context(
         .filter_map(|v| Message::from_json(v, Some(msg.group_id)))
         .filter(|m| !m.plain_text().starts_with('/'))
         .collect();
-    if !is_poke && msg.msg_id != 0 && !recent_msgs.iter().any(|m| m.msg_id == msg.msg_id) {
+    let mut recent_msgs = recent_msgs;
+    if !is_notice && msg.msg_id != 0 && !recent_msgs.iter().any(|m| m.msg_id == msg.msg_id) {
         recent_msgs.push(msg.clone());
     }
-    let since = recent_msgs
+    // 群事件单独收集：先看已入内存的，再看历史里带的
+    let mut notice_msgs: Vec<Message> =
+        recent_msgs.iter().filter(|m| m.is_notice()).cloned().collect();
+    let mut real_msgs: Vec<Message> =
+        recent_msgs.iter().filter(|m| !m.is_notice()).cloned().collect();
+    // {recent_text} 只保留真消息。历史接口按时间倒序返回，当前消息可能追加在末尾，
+    // 必须先按时间倒序排再截断，否则会把最新那条切掉
+    real_msgs.sort_by(|a, b| b.time.partial_cmp(&a.time).unwrap_or(std::cmp::Ordering::Equal));
+    real_msgs.truncate(history_num as usize);
+    // 群事件时间线以 {recent_text} 的窗口为准
+    let since = real_msgs
         .iter()
         .map(|m| m.time)
         .fold(None, |acc: Option<f64>, t| Some(acc.map(|a| a.min(t)).unwrap_or(t)))
         .unwrap_or(msg.time);
-    let mut poke_keys: HashSet<(i64, i64, i64)> = recent_msgs
-        .iter()
-        .filter(|m| m.is_poke())
-        .map(|m| m.poke_key())
-        .collect();
-    for poke in collect_recent_pokes(msg.group_id, since) {
-        let key = poke.poke_key();
-        if poke_keys.insert(key) {
-            recent_msgs.push(poke);
+    let mut notice_keys: HashSet<(i64, i64, String, String, i64, i64, i64)> =
+        notice_msgs.iter().map(|m| m.notice_key()).collect();
+    for notice in collect_recent_notices(msg.group_id, since) {
+        let key = notice.notice_key();
+        if notice_keys.insert(key) {
+            notice_msgs.push(notice);
         }
     }
-    log::info(format!("获取最近共 {} 条有效聊天记录", recent_msgs.len()));
+    log::info(format!(
+        "获取最近共 {} 条有效聊天记录、{} 条群事件",
+        real_msgs.len(),
+        notice_msgs.len()
+    ));
 
     let (self_id, _) = get_self_info(state, msg.group_id).await?;
-    let recent_text = format_msgs(
+    let mut all = real_msgs.clone();
+    all.extend(notice_msgs);
+    let (recent_text, notice_lines) = format_msgs(
         state,
-        &recent_msgs,
+        &all,
         cfg.f64_or("image_caption.image_limit", 1.0),
         cfg.f64_or("image_caption.image_prob", 1.0),
         cfg.f64_or("image_caption.emotion_limit", 1.0),
@@ -555,7 +590,7 @@ async fn prepare_context(
         anyhow::bail!("生成聊天记录摘要失败，放弃聊天处理");
     }
     let mut last_long_msg = None;
-    for m in recent_msgs.iter().rev() {
+    for m in real_msgs.iter().rev() {
         let t = m.plain_text();
         if t.chars().count() >= 4 {
             last_long_msg = Some(t);
@@ -579,7 +614,7 @@ async fn prepare_context(
         .first()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("embedding 为空"))?;
-    Ok((recent_msgs, recent_text, recent_summary, query_embs, recent_emb))
+    Ok((recent_msgs, notice_lines, recent_text, recent_summary, query_embs, recent_emb))
 }
 
 struct ExecAction {
