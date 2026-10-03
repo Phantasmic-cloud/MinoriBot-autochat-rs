@@ -14,6 +14,7 @@ use crate::voice::{prefetch_voice, VoiceHit};
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -222,7 +223,7 @@ pub async fn chat(state: &AppState, msg: Message) {
     log::info("=".repeat(20));
     log::info(format!("开始对消息 {} 进行聊天处理", msg.msg_id));
 
-    let (recent_msgs, notice_lines, recent_text, recent_summary, query_embs, recent_emb) =
+    let (recent_msgs, notice_msgs, notice_lines, recent_text, recent_summary, query_embs, recent_emb) =
         match prepare_context(state, &msg, is_notice).await {
             Ok(v) => v,
             Err(e) => {
@@ -284,8 +285,9 @@ pub async fn chat(state: &AppState, msg: Message) {
 
     let sm_num = cfg.usize_or("chat.mem.sm_num", 5);
     let mut sm_text = String::new();
+    let mut sms: Vec<SelfMemory> = Vec::new();
     if sm_num > 0 {
-        let mut sms: Vec<SelfMemory> = mem.sm_get();
+        sms = mem.sm_get();
         if sms.len() > sm_num {
             sms = sms.split_off(sms.len() - sm_num);
         }
@@ -426,7 +428,36 @@ pub async fn chat(state: &AppState, msg: Message) {
     let actions = parse_actions(&llm_response);
     let user_updates = llm_response.get("user_updates").cloned().unwrap_or(json!([]));
 
-    let send_msg_id_texts = match execute_actions(state, &msg, &recent_msgs, &actions).await {
+    // LLM 输出标记的有效范围。
+    // [reply=id] 认 {recent_text} 与 {sm_text} 出现过的 msgid；
+    // [@qqid] 认 {recent_text} 与 {notice_text} 出现过的人（当事人/操作者/被戳者）。
+    let mut valid_reply_ids: HashSet<i64> = recent_msgs.iter().map(|m| m.msg_id).collect();
+    valid_reply_ids.extend(sms.iter().filter_map(|s| s.id.parse::<i64>().ok()));
+    let mut valid_at_ids: HashSet<i64> = recent_msgs.iter().map(|m| m.user_id).collect();
+    for nm in &notice_msgs {
+        let nd = nm.notice_data();
+        if nm.user_id != 0 {
+            valid_at_ids.insert(nm.user_id);
+        }
+        for key in ["operator_id", "target_id"] {
+            if let Some(v) = json_i64(nd.get(key)) {
+                if v != 0 {
+                    valid_at_ids.insert(v);
+                }
+            }
+        }
+    }
+
+    let send_msg_id_texts = match execute_actions(
+        state,
+        &msg,
+        &recent_msgs,
+        &valid_at_ids,
+        &valid_reply_ids,
+        &actions,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
             log::error(format!("发送回复时失败: {e}"));
@@ -523,7 +554,15 @@ async fn prepare_context(
     state: &AppState,
     msg: &Message,
     is_notice: bool,
-) -> anyhow::Result<(Vec<Message>, String, String, String, Vec<Vec<f32>>, Vec<f32>)> {
+) -> anyhow::Result<(
+    Vec<Message>,
+    Vec<Message>,
+    String,
+    String,
+    String,
+    Vec<Vec<f32>>,
+    Vec<f32>,
+)> {
     let cfg = Config::global();
     let history_num = cfg.i64_or("chat.history_msg_num", 20);
     // 多拉一倍：{recent_text} 只放真消息，群事件拆到 {notice_text} 后不该占 recent 名额
@@ -574,7 +613,7 @@ async fn prepare_context(
 
     let (self_id, _) = get_self_info(state, msg.group_id).await?;
     let mut all = real_msgs.clone();
-    all.extend(notice_msgs);
+    all.extend(notice_msgs.iter().cloned());
     let (recent_text, notice_lines) = format_msgs(
         state,
         &all,
@@ -614,7 +653,7 @@ async fn prepare_context(
         .first()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("embedding 为空"))?;
-    Ok((recent_msgs, notice_lines, recent_text, recent_summary, query_embs, recent_emb))
+    Ok((recent_msgs, notice_msgs, notice_lines, recent_text, recent_summary, query_embs, recent_emb))
 }
 
 struct ExecAction {
@@ -623,10 +662,99 @@ struct ExecAction {
     tts_hit: Option<VoiceHit>,
 }
 
+/// LLM 输出里的标记转成真正发出去的 CQ 码。对齐 py 的 `process_reply_text`。
+///
+/// 规则：
+/// - `[reply=id]` 一条消息最多带一个，且必须放在最前面；无论 LLM 写在哪、有几个，
+///   全部先摘出来，只保留在上下文里出现过的 msgid。多个有效则全丢。
+/// - `[@qqid]` 可多个，各自留在原位置；不在上下文里的人直接删掉，不留裸文本。
+///   只认数字 qqid，`[@全体成员]` 这类非数字写法按普通文字原样发出。
+fn build_send_text(
+    text: &str,
+    valid_at_ids: &HashSet<i64>,
+    valid_reply_ids: &HashSet<i64>,
+    max_length: i64,
+) -> String {
+    static AT_RE: OnceLock<Regex> = OnceLock::new();
+    static REPLY_RE: OnceLock<Regex> = OnceLock::new();
+    let at_re = AT_RE.get_or_init(|| Regex::new(r"\[@(\d+)\]").unwrap());
+    let reply_re = REPLY_RE.get_or_init(|| Regex::new(r"\[reply=(-?\d+)\]").unwrap());
+
+    // ---- [reply=id]：一条消息最多一个，放最前 ----
+    let reply_ids: Vec<i64> = reply_re
+        .captures_iter(text)
+        .filter_map(|c| c[1].parse::<i64>().ok())
+        .collect();
+    let mut out = reply_re.replace_all(text, "").to_string();
+    let valid_reply: Vec<i64> = reply_ids
+        .iter()
+        .copied()
+        .filter(|id| valid_reply_ids.contains(id))
+        .collect();
+    if valid_reply.len() == 1 {
+        out = format!("[CQ:reply,id={}]{}", valid_reply[0], out);
+    }
+
+    // ---- [@qqid]：可多个，各自留原位 ----
+    out = at_re.replace_all(&out, |caps: &regex::Captures| {
+        let Ok(qid) = caps[1].parse::<i64>() else {
+            return caps[0].to_string();
+        };
+        if valid_at_ids.contains(&qid) {
+            format!("[CQ:at,qq={qid}]")
+        } else {
+            String::new()
+        }
+    })
+    .to_string();
+
+    truncate(&out, max_length)
+}
+
+/// 记录发送前后的标记变化，方便排查被丢弃的 at / reply。
+fn log_send_marks(
+    index: i32,
+    raw: &str,
+    sent: &str,
+    valid_at_ids: &HashSet<i64>,
+    valid_reply_ids: &HashSet<i64>,
+) {
+    static AT_RE: OnceLock<Regex> = OnceLock::new();
+    static REPLY_RE: OnceLock<Regex> = OnceLock::new();
+    let at_re = AT_RE.get_or_init(|| Regex::new(r"\[@(\d+)\]").unwrap());
+    let reply_re = REPLY_RE.get_or_init(|| Regex::new(r"\[reply=(-?\d+)\]").unwrap());
+    let collect = |re: &Regex, s: &str| -> Vec<i64> {
+        re.captures_iter(s)
+            .filter_map(|c| c[1].parse::<i64>().ok())
+            .collect()
+    };
+    let kept_at: Vec<i64> = collect(at_re, raw)
+        .into_iter()
+        .filter(|id| valid_at_ids.contains(id))
+        .collect();
+    let drop_at: Vec<i64> = collect(at_re, raw)
+        .into_iter()
+        .filter(|id| !valid_at_ids.contains(id))
+        .collect();
+    let kept_reply: Vec<i64> = collect(reply_re, raw)
+        .into_iter()
+        .filter(|id| valid_reply_ids.contains(id))
+        .collect();
+    let drop_reply: Vec<i64> = collect(reply_re, raw)
+        .into_iter()
+        .filter(|id| !valid_reply_ids.contains(id))
+        .collect();
+    log::info(format!(
+        "自动聊天生成回复{index}: {sent} at_id={kept_at:?} reply_id={kept_reply:?} 丢弃的at={drop_at:?} 无效reply={drop_reply:?}"
+    ));
+}
+
 async fn execute_actions(
     state: &AppState,
     msg: &Message,
     recent_msgs: &[Message],
+    valid_at_ids: &HashSet<i64>,
+    valid_reply_ids: &HashSet<i64>,
     actions: &[Action],
 ) -> anyhow::Result<Vec<(i64, &'static str, String)>> {
     let cfg = Config::global();
@@ -736,8 +864,6 @@ async fn execute_actions(
         }
     }
 
-    let at_re = Regex::new(r"\[@(\d+)\]").unwrap();
-    let reply_re = Regex::new(r"\[reply=(-?\d+)\]").unwrap();
     let mut text_index = 0i32;
 
     for item in exec_actions {
@@ -749,31 +875,14 @@ async fn execute_actions(
                     log::info(format!("LLM生成的回复{text_index}为空，放弃发送"));
                     continue;
                 }
-                let mut at_id: Option<i64> = None;
-                let mut reply_id: Option<i64> = None;
-                if let Some(cap) = at_re.captures(&text) {
-                    if let Ok(id) = cap[1].parse::<i64>() {
-                        at_id = Some(id);
-                        text = text.replace(&cap[0], "");
-                        if recent_msgs.iter().any(|m| m.user_id == id) {
-                            text = format!("[CQ:at,qq={id}]{text}");
-                        }
-                    }
-                }
-                if let Some(cap) = reply_re.captures(&text) {
-                    if let Ok(id) = cap[1].parse::<i64>() {
-                        reply_id = Some(id);
-                        text = text.replace(&cap[0], "");
-                        if recent_msgs.iter().any(|m| m.msg_id == id) {
-                            text = format!("[CQ:reply,id={id}]{text}");
-                        }
-                    }
-                }
-                text = truncate(&text, cfg.i64_or("chat.reply_max_length", 512));
-                log::info(format!(
-                    "自动聊天生成回复{text_index}: {text} at_id={:?} reply_id={:?}",
-                    at_id, reply_id
-                ));
+                let raw = text.clone();
+                text = build_send_text(
+                    &text,
+                    valid_at_ids,
+                    valid_reply_ids,
+                    cfg.i64_or("chat.reply_max_length", 512),
+                );
+                log_send_marks(text_index, &raw, &text, valid_at_ids, valid_reply_ids);
                 match state.rpc.send_group_msg(msg.group_id, &text).await {
                     Ok(ret) => {
                         let send_msg_id = json_i64(ret.get("message_id")).unwrap_or(0);
@@ -894,32 +1003,14 @@ async fn execute_actions(
                 }
                 if fallback {
                     text_index += 1;
-                    let mut send_text = text;
-                    let mut at_id: Option<i64> = None;
-                    let mut reply_id: Option<i64> = None;
-                    if let Some(cap) = at_re.captures(&send_text) {
-                        if let Ok(id) = cap[1].parse::<i64>() {
-                            at_id = Some(id);
-                            send_text = send_text.replace(&cap[0], "");
-                            if recent_msgs.iter().any(|m| m.user_id == id) {
-                                send_text = format!("[CQ:at,qq={id}]{send_text}");
-                            }
-                        }
-                    }
-                    if let Some(cap) = reply_re.captures(&send_text) {
-                        if let Ok(id) = cap[1].parse::<i64>() {
-                            reply_id = Some(id);
-                            send_text = send_text.replace(&cap[0], "");
-                            if recent_msgs.iter().any(|m| m.msg_id == id) {
-                                send_text = format!("[CQ:reply,id={id}]{send_text}");
-                            }
-                        }
-                    }
-                    send_text = truncate(&send_text, cfg.i64_or("chat.reply_max_length", 512));
-                    log::info(format!(
-                        "自动聊天生成回复{text_index}: {send_text} at_id={:?} reply_id={:?}",
-                        at_id, reply_id
-                    ));
+                    let raw = text;
+                    let send_text = build_send_text(
+                        &raw,
+                        valid_at_ids,
+                        valid_reply_ids,
+                        cfg.i64_or("chat.reply_max_length", 512),
+                    );
+                    log_send_marks(text_index, &raw, &send_text, valid_at_ids, valid_reply_ids);
                     match state.rpc.send_group_msg(msg.group_id, &send_text).await {
                         Ok(ret) => {
                             let send_msg_id = json_i64(ret.get("message_id")).unwrap_or(0);

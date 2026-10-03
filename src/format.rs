@@ -107,25 +107,31 @@ pub async fn get_image_caption(state: &AppState, data: &Value, use_llm: bool) ->
 /// 禁言时长转成人类可读描述。duration 单位为秒。
 fn ban_desc(duration: i64) -> String {
     if duration <= 0 {
-        return "被永久禁言".into();
+        return "永久禁言".into();
     }
     if duration % 86400 == 0 {
-        format!("被禁言{}天", duration / 86400)
+        format!("禁言{}天", duration / 86400)
     } else if duration % 3600 == 0 {
-        format!("被禁言{}小时", duration / 3600)
+        format!("禁言{}小时", duration / 3600)
     } else if duration % 60 == 0 {
-        format!("被禁言{}分钟", duration / 60)
+        format!("禁言{}分钟", duration / 60)
     } else {
-        format!("被禁言{duration}秒")
+        format!("禁言{duration}秒")
     }
 }
 
 /// 把一条群事件渲染成一行自然语言，供 {notice_text} 注入。对齐 py 的 `format_notice`。
+///
+/// 事件里 user_id 是当事人、operator_id 是操作者（禁言者/邀请者/踢人者），
+/// target_id 只在 poke 时有值，表示被戳的那个。
 pub fn format_notice(msg: &Message, self_id: i64) -> String {
     let d = msg.notice_data();
     let ntype = d.get("notice_type").and_then(|v| v.as_str()).unwrap_or("");
     let stype = d.get("sub_type").and_then(|v| v.as_str()).unwrap_or("");
     let who = person_label(msg.user_id, &msg.nickname, self_id);
+    let opid = json_i64(d.get("operator_id"));
+    let opname = d.get("operator_name").and_then(|v| v.as_str()).unwrap_or("");
+    let op = person_label(opid, opname, self_id);
     if ntype == "notify" && stype == "poke" {
         let tid = json_i64(d.get("target_id"));
         let tname = d
@@ -135,21 +141,24 @@ pub fn format_notice(msg: &Message, self_id: i64) -> String {
         let tname = if tname.is_empty() { tid.to_string() } else { tname.to_string() };
         return format!("{who} 戳了戳 {}", person_label(tid, &tname, self_id));
     }
+    if ntype == "group_ban" {
+        if stype == "lift_ban" {
+            return format!("{who} 被 {op} 解除禁言");
+        }
+        return format!("{who} 被 {op} {}", ban_desc(json_i64(d.get("duration"))));
+    }
     if ntype == "group_increase" {
+        // operator_id 为 0（或与当事人相同）表示自己主动进群，否则是被邀请
+        if opid != 0 && opid != msg.user_id {
+            return format!("{op} 邀请 {who} 加入群聊");
+        }
         return format!("{who} 加入群聊");
     }
     if ntype == "group_decrease" {
-        return if stype == "kick" {
-            format!("{who} 被踢出群聊")
-        } else {
-            format!("{who} 退出群聊")
-        };
-    }
-    if ntype == "group_ban" {
-        if stype == "lift_ban" {
-            return format!("{who} 被解除禁言");
+        if stype == "kick" && opid != 0 {
+            return format!("{who} 被 {op} 踢出群聊");
         }
-        return format!("{who} {}", ban_desc(json_i64(d.get("duration"))));
+        return format!("{who} 退出群聊");
     }
     format!("{who} 发生了一条群事件")
 }
@@ -157,11 +166,14 @@ pub fn format_notice(msg: &Message, self_id: i64) -> String {
 /// 把自身记忆里的 CQ 码还原成 {recent_text} 的写法。对齐 py 的 `_cq_to_readable`。
 pub fn cq_to_readable(text: &str) -> String {
     static AT_RE: OnceLock<Regex> = OnceLock::new();
+    static AT_ALL_RE: OnceLock<Regex> = OnceLock::new();
     static REPLY_RE: OnceLock<Regex> = OnceLock::new();
+    let at_all_re = AT_ALL_RE.get_or_init(|| Regex::new(r"\[CQ:at,qq=all(?:,[^\]]*)?\]").unwrap());
     let at_re = AT_RE.get_or_init(|| Regex::new(r"\[CQ:at,qq=(\d+)(?:,[^\]]*)?\]").unwrap());
     let reply_re =
         REPLY_RE.get_or_init(|| Regex::new(r"\[CQ:reply,id=(-?\d+)(?:,[^\]]*)?\]").unwrap());
-    let s = at_re.replace_all(text, "[@$1]").to_string();
+    let s = at_all_re.replace_all(text, "[@全体成员]").to_string();
+    let s = at_re.replace_all(&s, "[@$1]").to_string();
     reply_re.replace_all(&s, "[reply=$1]").to_string()
 }
 
@@ -217,7 +229,12 @@ pub async fn format_msgs(
                         .get("qq")
                         .map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string()))
                         .unwrap_or_default();
-                    text.push_str(&format!("[@{qq}]"));
+                    // @全体成员在注入侧展开成中文，LLM 侧只允许输出数字 qqid
+                    if qq == "all" {
+                        text.push_str("[@全体成员]");
+                    } else {
+                        text.push_str(&format!("[@{qq}]"));
+                    }
                 }
                 "reply" => {
                     let id = sdata
